@@ -189,34 +189,27 @@ class MoECompressed:
         self.inter_size = inter_size
         self.hidden_size = hidden_size
 
-    def dequantize_experts(
+    def dequantize_expert(
         self,
-        experts: torch.Tensor,
+        expert_id: int,
         which: str,
         *,
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
-        """Return dense weights for selected experts on `device`.
+        """Return dense weights for a single expert on `device`.
 
-        which == "mlp1" -> shape (k, 2*inter_size, hidden_size)
-        which == "mlp2" -> shape (k, hidden_size, inter_size)
+        which == "mlp1" -> shape (2*inter_size, hidden_size)
+        which == "mlp2" -> shape (hidden_size, inter_size)
         """
         assert which in ("mlp1", "mlp2")
-        # Ensure index tensor is on the same device as the source tensors for index_select
-        # Keep indices on CPU (pinned) to gather, then move gathered blocks/scales to target device
-        experts = experts.to(device=self.mlp1_blocks.device, dtype=torch.long)
         if which == "mlp1":
-            blocks = self.mlp1_blocks.index_select(0, experts)
-            scales = self.mlp1_scales.index_select(0, experts)
-            blocks = blocks.to(device, non_blocking=True)
-            scales = scales.to(device, non_blocking=True)
-            dense = decode_mxfp4_blocks(blocks, scales, dtype=dtype)
-            return dense.view(-1, 2 * self.inter_size, self.hidden_size)
+            blk = self.mlp1_blocks[expert_id].to(device, non_blocking=True)
+            scl = self.mlp1_scales[expert_id].to(device, non_blocking=True)
+            dense = decode_mxfp4_blocks(blk, scl, dtype=dtype)
+            return dense.view(2 * self.inter_size, self.hidden_size)
         else:
-            blocks = self.mlp2_blocks.index_select(0, experts)
-            scales = self.mlp2_scales.index_select(0, experts)
-            blocks = blocks.to(device, non_blocking=True)
-            scales = scales.to(device, non_blocking=True)
-            dense = decode_mxfp4_blocks(blocks, scales, dtype=dtype)
-            return dense.view(-1, self.hidden_size, self.inter_size)
+            blk = self.mlp2_blocks[expert_id].to(device, non_blocking=True)
+            scl = self.mlp2_scales[expert_id].to(device, non_blocking=True)
+            dense = decode_mxfp4_blocks(blk, scl, dtype=dtype)
+            return dense.view(self.hidden_size, self.inter_size)
