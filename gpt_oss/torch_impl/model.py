@@ -35,6 +35,64 @@ from gpt_oss.torch_impl.weights import Checkpoint, MoECompressed
 import torch.nn.functional as F
 
 
+class GPUExpertCache:
+    """Global GPU LRU cache for dequantized MoE expert weights.
+
+    Keys by (layer_idx, expert_id) and stores a pair (W1, W2).
+    """
+    def __init__(self, capacity_bytes: int = 1_300_000_000) -> None:
+        self.capacity_bytes = int(capacity_bytes)
+        self._store: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._order: list[tuple[int, int]] = []  # LRU: front is oldest
+        self._used_bytes: int = 0
+
+    @staticmethod
+    def _pair_nbytes(W1: torch.Tensor, W2: torch.Tensor) -> int:
+        return (W1.numel() * W1.element_size()) + (W2.numel() * W2.element_size())
+
+    def _touch(self, key: tuple[int, int]) -> None:
+        try:
+            self._order.remove(key)
+        except ValueError:
+            pass
+        self._order.append(key)
+
+    def _evict_if_needed(self) -> None:
+        while self._used_bytes > self.capacity_bytes and self._order:
+            old = self._order.pop(0)
+            try:
+                W1, W2 = self._store.pop(old)
+            except KeyError:
+                continue
+            self._used_bytes -= self._pair_nbytes(W1, W2)
+            # Help GC promptly; don't force empty_cache every time
+            del W1, W2
+        # Optional: allow caller to call torch.cuda.empty_cache() if needed
+
+    def ensure_present(self, layer_idx: int, expert_id: int, comp: MoECompressed, device: torch.device) -> None:
+        key = (layer_idx, expert_id)
+        if key in self._store:
+            self._touch(key)
+            return
+        # Avoid illegal ops during CUDA graph capture
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("MoE expert cache miss during CUDA graph capture")
+        e_tensor = torch.tensor([expert_id], device=device)
+        W1 = comp.dequantize_experts(e_tensor, "mlp1", device=device)[0]
+        W2 = comp.dequantize_experts(e_tensor, "mlp2", device=device)[0]
+        self._store[key] = (W1, W2)
+        self._touch(key)
+        self._used_bytes += self._pair_nbytes(W1, W2)
+        self._evict_if_needed()
+
+    def get_or_dequantize(self, layer_idx: int, expert_id: int, comp: MoECompressed, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (layer_idx, expert_id)
+        if key in self._store:
+            self._touch(key)
+            return self._store[key]
+        self.ensure_present(layer_idx, expert_id, comp, device)
+        return self._store[key]
+
 @dataclass
 class ModelConfig:
     num_hidden_layers: int = 36
@@ -177,29 +235,29 @@ class RotaryEmbedding(torch.nn.Module):
         return query, key
 
 
-def sdpa_flash(Q, K, V, sm_scale, sliding_window=0):
-    """Use PyTorch SDPA/FlashAttention kernels. Ignores sinks for performance."""
-    # Q: (T, Hkv, q_mult, Dh); K,V: (T, Hkv, Dh)
-    T, Hkv, qmult, Dh = Q.shape
+def sdpa_flash(Q, K, V, sm_scale):
+    """Use PyTorch SDPA/FlashAttention kernels. Ignores sinks for performance.
+
+    Supports Q length != K/V length (e.g., decoding with cache).
+    """
+    # Q: (Tq, Hkv, q_mult, Dh); K,V: (Tk, Hkv, Dh)
+    Tq, Hkv, qmult, Dh = Q.shape
+    Tk = K.shape[0]
     H = Hkv * qmult
-    # Expand K,V heads to match q_mult
-    K = K[:, :, None, :].expand(T, Hkv, qmult, Dh)
-    V = V[:, :, None, :].expand(T, Hkv, qmult, Dh)
-    # Reshape to (B=1, H, T, Dh)
-    Q = Q.reshape(T, H, Dh).transpose(0, 1).unsqueeze(0)
-    K = K.reshape(T, H, Dh).transpose(0, 1).unsqueeze(0)
-    V = V.reshape(T, H, Dh).transpose(0, 1).unsqueeze(0)
+    # Expand K,V heads to match q_mult on the head-multiplicity axis only
+    K = K[:, :, None, :].expand(Tk, Hkv, qmult, Dh)
+    V = V[:, :, None, :].expand(Tk, Hkv, qmult, Dh)
+    # Reshape to (B=1, H, T{q|k}, Dh)
+    Q = Q.reshape(Tq, H, Dh).transpose(0, 1).unsqueeze(0)
+    K = K.reshape(Tk, H, Dh).transpose(0, 1).unsqueeze(0)
+    V = V.reshape(Tk, H, Dh).transpose(0, 1).unsqueeze(0)
 
-    attn_mask = None
-    if sliding_window > 0:
-        m = Q.new_full((T, T), float('-inf'))
-        tri = torch.triu(m, diagonal=1)
-        band = torch.tril(m, diagonal=-sliding_window)
-        attn_mask = tri + band
-
-    out = F.scaled_dot_product_attention(Q, K, V, attn_mask=attn_mask, is_causal=True, scale=sm_scale)
-    # back to (T, H*Dh)
-    out = out.squeeze(0).transpose(0, 1).reshape(T, -1)
+    # Keep FlashAttention by avoiding dense masks. If lengths differ, we've
+    # already ensured K/V only include past tokens, so causal masking is redundant.
+    is_causal = (Tq == Tk)
+    out = F.scaled_dot_product_attention(Q, K, V, is_causal=is_causal, scale=sm_scale)
+    # back to (Tq, H*Dh)
+    out = out.squeeze(0).transpose(0, 1).reshape(Tq, -1)
     return out
 
 
@@ -275,14 +333,26 @@ class AttentionBlock(torch.nn.Module):
 
         # Apply RoPE
         if cache is not None:
-            q, k = self.rope(q, k, offset=int(cache.offset.item()))
+            # Apply RoPE w.r.t. running position
+            o = int(cache.offset.item())
+            q, k = self.rope(q, k, offset=o)
             # Extend cache and build full K/V up to current position
             K_full, V_full = cache.extend(k, v)
+            # Sliding window without masks: slice KV to preserve FlashAttention
+            if self.sliding_window > 0:
+                lo = max(0, o - self.sliding_window + 1)
+                hi = o + T
+                K_win = K_full[lo:hi, ...]
+                V_win = V_full[lo:hi, ...]
+            else:
+                K_win = K_full[: o + T, ...]
+                V_win = V_full[: o + T, ...]
             # SDPA/FlashAttention path (sinks ignored for perf)
-            t = sdpa_flash(q, K_full, V_full, self.sm_scale, self.sliding_window)
+            t = sdpa_flash(q, K_win, V_win, self.sm_scale)
         else:
             q, k = self.rope(q, k, offset=0)
-            t = sdpa_flash(q, k, v, self.sm_scale, self.sliding_window)
+            # No cache: full attention over current tokens
+            t = sdpa_flash(q, k, v, self.sm_scale)
 
         t = self.out(t)
         t = x + t
@@ -304,8 +374,12 @@ class MLPBlock(torch.nn.Module):
         self,
         config: ModelConfig,
         device: torch.device | None = None,
+        *,
+        layer_idx: int = 0,
+        gpu_cache: "GPUExpertCache | None" = None,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
         self.num_experts = config.num_experts
         self.experts_per_token = config.experts_per_token
         self.swiglu_limit = config.swiglu_limit
@@ -331,41 +405,26 @@ class MLPBlock(torch.nn.Module):
         )
         # Set by from_checkpoint: per-layer compressed MoE weights on CPU
         self.compressed: MoECompressed | None = None
-        # Simple device-side LRU cache for dequantized experts
-        self._expert_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        self._expert_cache_order: list[int] = []
-        self._expert_cache_capacity: int = 24
+        # Shared GPU cache of dequantized experts across layers
+        self.gpu_cache = gpu_cache
         # H2D prefetch stream (if CUDA)
         self.h2d_stream = torch.cuda.Stream(device=device) if torch.cuda.is_available() and (device is None or device.type == 'cuda') else None
+        self._prefetch_evt = torch.cuda.Event() if self.h2d_stream is not None else None
 
     def set_compressed(self, comp: MoECompressed):
         self.compressed = comp
-        self._expert_cache.clear()
-        self._expert_cache_order.clear()
 
     def _get_expert_weights(self, e: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        if e in self._expert_cache:
-            # update LRU order
-            try:
-                self._expert_cache_order.remove(e)
-            except ValueError:
-                pass
-            self._expert_cache_order.append(e)
-            return self._expert_cache[e]
-        e_tensor = torch.tensor([e], device=device)
-        W1 = self.compressed.dequantize_experts(e_tensor, "mlp1", device=device)[0]
-        W2 = self.compressed.dequantize_experts(e_tensor, "mlp2", device=device)[0]
-        # insert into cache
-        self._expert_cache[e] = (W1, W2)
-        self._expert_cache_order.append(e)
-        if len(self._expert_cache_order) > self._expert_cache_capacity:
-            old = self._expert_cache_order.pop(0)
-            try:
-                del self._expert_cache[old]
-            except KeyError:
-                pass
-            torch.cuda.empty_cache()
-        return W1, W2
+        assert self.compressed is not None, "Compressed MoE weights not set."
+        if self.gpu_cache is None:
+            # Fallback to per-call dequant without caching (unlikely path)
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("MoE expert fetch during CUDA graph capture without cache")
+            e_tensor = torch.tensor([e], device=device)
+            W1 = self.compressed.dequantize_experts(e_tensor, "mlp1", device=device)[0]
+            W2 = self.compressed.dequantize_experts(e_tensor, "mlp2", device=device)[0]
+            return W1, W2
+        return self.gpu_cache.get_or_dequantize(self.layer_idx, e, self.compressed, device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert self.compressed is not None, "Compressed MoE weights not set."
@@ -386,11 +445,15 @@ class MLPBlock(torch.nn.Module):
         out = x.new_zeros((T, H))
 
         # Pre-fetch experts asynchronously to overlap H2D/dequant with compute
-        if self.h2d_stream is not None:
+        if self.h2d_stream is not None and self.gpu_cache is not None:
             with torch.cuda.stream(self.h2d_stream):
                 for e in uniq.tolist():
-                    _ = self._get_expert_weights(e, t.device)
-            torch.cuda.current_stream().wait_stream(self.h2d_stream)
+                    # Enqueue H2D + dequant on H2D stream via cache
+                    self.gpu_cache.ensure_present(self.layer_idx, e, self.compressed, t.device)
+                # Record a single event after enqueuing H2D/dequant for this batch of experts
+                self._prefetch_evt.record()
+            # Wait only on the recorded event instead of whole-stream serialization
+            torch.cuda.current_stream().wait_event(self._prefetch_evt)
 
         # For small T, simply loop over unique experts
         for e in uniq.tolist():
@@ -429,11 +492,13 @@ class TransformerBlock(torch.nn.Module):
         config: ModelConfig,
         layer_idx: int,
         device: torch.device | None = None,
+        *,
+        gpu_cache: "GPUExpertCache | None" = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
         self.attn = AttentionBlock(config, layer_idx, device)
-        self.mlp = MLPBlock(config, device)
+        self.mlp = MLPBlock(config, device, layer_idx=layer_idx, gpu_cache=gpu_cache)
 
     def forward(self, x: torch.Tensor, cache: "Cache" | None = None) -> torch.Tensor:
         x = self.attn(x, cache=cache)
@@ -451,20 +516,18 @@ class Transformer(torch.nn.Module):
         self.embedding = torch.nn.Embedding(
             config.vocab_size, config.hidden_size, device=device, dtype=torch.bfloat16
         )
+        # Global GPU expert cache shared across layers
+        cache_capacity = int(os.environ.get("GPT_OSS_GPU_EXPERT_CACHE_BYTES", str(1_300_000_000)))
+        self.moe_gpu_cache = GPUExpertCache(capacity_bytes=cache_capacity)
         self.block = torch.nn.ModuleList(
             [
-                TransformerBlock(config, layer_idx, device)
+                TransformerBlock(config, layer_idx, device, gpu_cache=self.moe_gpu_cache)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
         self.norm = RMSNorm(config.hidden_size, device=device)
-        self.unembedding = torch.nn.Linear(
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-            device=device,
-            dtype=torch.bfloat16,
-        )
+        # Tie unembedding to embedding to save VRAM
+        # We do not allocate a separate unembedding matrix; compute logits via matmul.
 
     def forward(self, x: torch.Tensor, caches: list["Cache"] | None = None) -> torch.Tensor:
         # x: (T,) token ids (long or int)
@@ -475,7 +538,8 @@ class Transformer(torch.nn.Module):
         for block, cache in zip(self.block, caches):
             x = block(x, cache=cache)
         x = self.norm(x)
-        x = self.unembedding(x)
+        # Matmul with tied embedding weights: (T, H) @ (H, V)
+        x = x @ self.embedding.weight.t()
         return x
 
     @staticmethod
@@ -571,9 +635,10 @@ class TokenGenerator:
             )
             for _ in range(config.num_hidden_layers)
         ]
-        # CUDA graph setup for fixed 1-token step
+        # CUDA graph setup for fixed 1-token step (disabled by default for MoE safety)
+        self._graphs_enabled = bool(int(os.environ.get("GPT_OSS_ENABLE_CUDAGRAPH", "0")))
         self._graph_ready = False
-        if self.device.type == 'cuda':
+        if self.device.type == 'cuda' and self._graphs_enabled:
             self._input_token = torch.zeros(1, dtype=torch.long, device=self.device)
             self._logits_buf = None
             self._graph = torch.cuda.CUDAGraph()
@@ -599,7 +664,7 @@ class TokenGenerator:
 
         num_generated_tokens = 0
         while max_tokens == 0 or num_generated_tokens < max_tokens:
-            if self.device.type == 'cuda':
+            if self.device.type == 'cuda' and self._graphs_enabled:
                 # Capture the 1-token step on first iteration
                 self._input_token[0] = current
                 if not self._graph_ready:
@@ -612,8 +677,12 @@ class TokenGenerator:
                     self._graph_ready = True
                     logits = self._logits_buf[-1]
                 else:
-                    self._graph.replay()
-                    logits = self._logits_buf[-1]
+                    try:
+                        self._graph.replay()
+                        logits = self._logits_buf[-1]
+                    except RuntimeError:
+                        # Fallback to uncaptured step (e.g., MoE cache miss)
+                        logits = self.model(self._input_token, caches=self.caches)[-1]
             else:
                 x = torch.as_tensor([current], dtype=torch.long, device=self.device)
                 logits = self.model(x, caches=self.caches)[-1]

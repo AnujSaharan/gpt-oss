@@ -203,7 +203,9 @@ class MoECompressed:
         which == "mlp2" -> shape (k, hidden_size, inter_size)
         """
         assert which in ("mlp1", "mlp2")
-        experts = experts.to(torch.long)
+        # Ensure index tensor is on the same device as the source tensors for index_select
+        # Keep indices on CPU (pinned) to gather, then move gathered blocks/scales to target device
+        experts = experts.to(device=self.mlp1_blocks.device, dtype=torch.long)
         if which == "mlp1":
             blocks = self.mlp1_blocks.index_select(0, experts)
             scales = self.mlp1_scales.index_select(0, experts)
