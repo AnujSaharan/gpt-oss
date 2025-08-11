@@ -5,3 +5,41 @@ __pycache__
 *.egg*
 node_modules/
 *.log
+
+# ML/AI: model weights and checkpoints (preserve dirs)
+**/weights/**
+!**/weights/.gitkeep
+**/checkpoints/**
+!**/checkpoints/.gitkeep
+**/runs/**
+!**/runs/.gitkeep
+**/outputs/**
+!**/outputs/.gitkeep
+**/.cache/**
+
+# Local clone of Triton (external)
+/triton/
+
+# Common model weight file types
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.h5
+*.gguf
+*.ggml
+*.bin
+*.bin.*
+*.model.fp16
+*.model.int*
+
+# Trainer/experiment frameworks
+wandb/
+**/wandb/**
+mlruns/
+**/mlruns/**
+
+# Optional: root-level data directory (preserve dir)
+/data/**
+!/data/.gitkeep
