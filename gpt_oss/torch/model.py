@@ -4,7 +4,31 @@ import os
 from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
+try:
+    import torch.distributed as dist  # type: ignore
+except Exception:
+    # Minimal shim when torch.distributed isn't available
+    class _DummyDist:
+        @staticmethod
+        def is_initialized() -> bool:
+            return False
+
+        @staticmethod
+        def get_world_size() -> int:
+            return 1
+
+        @staticmethod
+        def get_rank() -> int:
+            return 0
+
+        class ReduceOp:
+            SUM = None
+
+        @staticmethod
+        def all_reduce(*args, **kwargs):
+            raise RuntimeError("torch.distributed is not available")
+
+    dist = _DummyDist()  # type: ignore
 
 from gpt_oss.torch.weights import Checkpoint
 
@@ -475,3 +499,4 @@ class TokenGenerator:
 
             if predicted_token in stop_tokens:
                 break
+from __future__ import annotations
