@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import torch
 
@@ -57,4 +58,3 @@ def init_distributed() -> torch.device:
 
     suppress_output(rank if use_ddp else 0)
     return device
-from __future__ import annotations

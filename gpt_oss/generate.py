@@ -11,12 +11,12 @@ from gpt_oss.tokenizer import get_tokenizer
 def main(args):
     match args.backend:
         case "torch":
-            from gpt_oss.torch.utils import init_distributed
-            from gpt_oss.torch.model import TokenGenerator as TorchGenerator
+            from gpt_oss.torch_impl.utils import init_distributed
+            from gpt_oss.torch_impl.model import TokenGenerator as TorchGenerator
             device = init_distributed()
             generator = TorchGenerator(args.checkpoint, device=device)
         case "triton":
-            from gpt_oss.torch.utils import init_distributed
+            from gpt_oss.torch_impl.utils import init_distributed
             from gpt_oss.triton.model import TokenGenerator as TritonGenerator
             device = init_distributed()
             generator = TritonGenerator(args.checkpoint, context=4096, device=device)

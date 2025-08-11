@@ -1,3 +1,4 @@
+from __future__ import annotations
 import json
 import math
 import os
@@ -30,7 +31,8 @@ except Exception:
 
     dist = _DummyDist()  # type: ignore
 
-from gpt_oss.torch.weights import Checkpoint
+from gpt_oss.torch_impl.weights import Checkpoint, MoECompressed
+import torch.nn.functional as F
 
 
 @dataclass
@@ -146,9 +148,9 @@ class RotaryEmbedding(torch.nn.Module):
 
         return concentration, inv_freq
 
-    def _compute_cos_sin(self, num_tokens: int):
+    def _compute_cos_sin(self, num_tokens: int, start: int = 0):
         concentration, inv_freq = self._compute_concentration_and_inv_freq()
-        t = torch.arange(num_tokens, dtype=torch.float32, device=self.device)
+        t = torch.arange(start, start + num_tokens, dtype=torch.float32, device=self.device)
         freqs = torch.einsum("i,j->ij", t, inv_freq)
         cos = freqs.cos() * concentration
         sin = freqs.sin() * concentration
@@ -158,9 +160,10 @@ class RotaryEmbedding(torch.nn.Module):
         self,
         query: torch.Tensor,
         key: torch.Tensor,
+        offset: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_tokens = query.shape[0]
-        cos, sin = self._compute_cos_sin(num_tokens)
+        cos, sin = self._compute_cos_sin(num_tokens, start=offset)
 
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_dim)
@@ -174,27 +177,30 @@ class RotaryEmbedding(torch.nn.Module):
         return query, key
 
 
-def sdpa(Q, K, V, S, sm_scale, sliding_window=0):
-    # sliding_window == 0 means no sliding window
-    n_tokens, n_heads, q_mult, d_head = Q.shape
-    assert K.shape == (n_tokens, n_heads, d_head)
-    assert V.shape == (n_tokens, n_heads, d_head)
-    K = K[:, :, None, :].expand(-1, -1, q_mult, -1)
-    V = V[:, :, None, :].expand(-1, -1, q_mult, -1)
-    S = S.reshape(n_heads, q_mult, 1, 1).expand(-1, -1, n_tokens, -1)
-    mask = torch.triu(Q.new_full((n_tokens, n_tokens), -float("inf")), diagonal=1)
+def sdpa_flash(Q, K, V, sm_scale, sliding_window=0):
+    """Use PyTorch SDPA/FlashAttention kernels. Ignores sinks for performance."""
+    # Q: (T, Hkv, q_mult, Dh); K,V: (T, Hkv, Dh)
+    T, Hkv, qmult, Dh = Q.shape
+    H = Hkv * qmult
+    # Expand K,V heads to match q_mult
+    K = K[:, :, None, :].expand(T, Hkv, qmult, Dh)
+    V = V[:, :, None, :].expand(T, Hkv, qmult, Dh)
+    # Reshape to (B=1, H, T, Dh)
+    Q = Q.reshape(T, H, Dh).transpose(0, 1).unsqueeze(0)
+    K = K.reshape(T, H, Dh).transpose(0, 1).unsqueeze(0)
+    V = V.reshape(T, H, Dh).transpose(0, 1).unsqueeze(0)
+
+    attn_mask = None
     if sliding_window > 0:
-        mask += torch.tril(
-            mask.new_full((n_tokens, n_tokens), -float("inf")), diagonal=-sliding_window
-        )
-    QK = torch.einsum("qhmd,khmd->hmqk", Q, K)
-    QK *= sm_scale
-    QK += mask[None, None, :, :]
-    QK = torch.cat([QK, S], dim=-1)
-    W = torch.softmax(QK, dim=-1)
-    W = W[..., :-1]
-    attn = torch.einsum("hmqk,khmd->qhmd", W, V)
-    return attn.reshape(n_tokens, -1)
+        m = Q.new_full((T, T), float('-inf'))
+        tri = torch.triu(m, diagonal=1)
+        band = torch.tril(m, diagonal=-sliding_window)
+        attn_mask = tri + band
+
+    out = F.scaled_dot_product_attention(Q, K, V, attn_mask=attn_mask, is_causal=True, scale=sm_scale)
+    # back to (T, H*Dh)
+    out = out.squeeze(0).transpose(0, 1).reshape(T, -1)
+    return out
 
 
 class AttentionBlock(torch.nn.Module):
@@ -238,7 +244,9 @@ class AttentionBlock(torch.nn.Module):
             device=device,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: "Cache" | None = None) -> torch.Tensor:
+        # x: (T, C) unbatched sequence
+        T, _ = x.shape
         t = self.norm(x)
         qkv = self.qkv(t)
         q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()
@@ -255,16 +263,27 @@ class AttentionBlock(torch.nn.Module):
             * self.head_dim,
         ].contiguous()
 
+        # Reshape into heads
         q = q.view(
-            -1,
+            T,
             self.num_key_value_heads,
             self.num_attention_heads // self.num_key_value_heads,
             self.head_dim,
         )
-        k = k.view(-1, self.num_key_value_heads, self.head_dim)
-        v = v.view(-1, self.num_key_value_heads, self.head_dim)
-        q, k = self.rope(q, k)
-        t = sdpa(q, k, v, self.sinks, self.sm_scale, self.sliding_window)
+        k = k.view(T, self.num_key_value_heads, self.head_dim)
+        v = v.view(T, self.num_key_value_heads, self.head_dim)
+
+        # Apply RoPE
+        if cache is not None:
+            q, k = self.rope(q, k, offset=int(cache.offset.item()))
+            # Extend cache and build full K/V up to current position
+            K_full, V_full = cache.extend(k, v)
+            # SDPA/FlashAttention path (sinks ignored for perf)
+            t = sdpa_flash(q, K_full, V_full, self.sm_scale, self.sliding_window)
+        else:
+            q, k = self.rope(q, k, offset=0)
+            t = sdpa_flash(q, k, v, self.sm_scale, self.sliding_window)
+
         t = self.out(t)
         t = x + t
         return t
@@ -296,31 +315,9 @@ class MLPBlock(torch.nn.Module):
             config.hidden_size, config.num_experts, device=device, dtype=torch.bfloat16
         )
         assert config.intermediate_size % self.world_size == 0
-        self.mlp1_weight = torch.nn.Parameter(
-            torch.empty(
-                (
-                    config.num_experts,
-                    config.intermediate_size * 2 // self.world_size,
-                    config.hidden_size,
-                ),
-                device=device,
-                dtype=torch.bfloat16,
-            )
-        )
         self.mlp1_bias = torch.nn.Parameter(
             torch.empty(
                 (config.num_experts, config.intermediate_size * 2 // self.world_size),
-                device=device,
-                dtype=torch.bfloat16,
-            )
-        )
-        self.mlp2_weight = torch.nn.Parameter(
-            torch.empty(
-                (
-                    config.num_experts,
-                    config.hidden_size,
-                    config.intermediate_size // self.world_size,
-                ),
                 device=device,
                 dtype=torch.bfloat16,
             )
@@ -332,32 +329,98 @@ class MLPBlock(torch.nn.Module):
                 dtype=torch.bfloat16,
             )
         )
+        # Set by from_checkpoint: per-layer compressed MoE weights on CPU
+        self.compressed: MoECompressed | None = None
+        # Simple device-side LRU cache for dequantized experts
+        self._expert_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._expert_cache_order: list[int] = []
+        self._expert_cache_capacity: int = 24
+        # H2D prefetch stream (if CUDA)
+        self.h2d_stream = torch.cuda.Stream(device=device) if torch.cuda.is_available() and (device is None or device.type == 'cuda') else None
+
+    def set_compressed(self, comp: MoECompressed):
+        self.compressed = comp
+        self._expert_cache.clear()
+        self._expert_cache_order.clear()
+
+    def _get_expert_weights(self, e: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        if e in self._expert_cache:
+            # update LRU order
+            try:
+                self._expert_cache_order.remove(e)
+            except ValueError:
+                pass
+            self._expert_cache_order.append(e)
+            return self._expert_cache[e]
+        e_tensor = torch.tensor([e], device=device)
+        W1 = self.compressed.dequantize_experts(e_tensor, "mlp1", device=device)[0]
+        W2 = self.compressed.dequantize_experts(e_tensor, "mlp2", device=device)[0]
+        # insert into cache
+        self._expert_cache[e] = (W1, W2)
+        self._expert_cache_order.append(e)
+        if len(self._expert_cache_order) > self._expert_cache_capacity:
+            old = self._expert_cache_order.pop(0)
+            try:
+                del self._expert_cache[old]
+            except KeyError:
+                pass
+            torch.cuda.empty_cache()
+        return W1, W2
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        t = self.norm(x)
-        g = self.gate(t)
-        experts = torch.topk(g, k=self.experts_per_token, dim=-1, sorted=True)
-        expert_weights = torch.nn.functional.softmax(experts.values, dim=1)
-        expert_indices = experts.indices
+        assert self.compressed is not None, "Compressed MoE weights not set."
+        t = self.norm(x)  # (T, H)
+        g = self.gate(t)  # (T, E)
+        top = torch.topk(g, k=self.experts_per_token, dim=-1, sorted=True)
+        probs = torch.softmax(top.values, dim=-1)  # (T, k)
+        idx = top.indices  # (T, k)
 
-        # MLP #1
-        mlp1_weight = self.mlp1_weight[expert_indices, ...]
-        mlp1_bias = self.mlp1_bias[expert_indices, ...]
-        t = torch.einsum("beck,bk->bec", mlp1_weight, t) + mlp1_bias
-        t = swiglu(t, limit=self.swiglu_limit)
+        T, H = t.shape
+        k = self.experts_per_token
+        E = self.num_experts
+        I = self.compressed.inter_size
 
-        # MLP #2
-        mlp2_weight = self.mlp2_weight[expert_indices, ...]
-        mlp2_bias = self.mlp2_bias[expert_indices, ...]
-        t = torch.einsum("beck,bek->bec", mlp2_weight, t)
+        # Group tokens by expert to avoid duplicating weights per token
+        # Build mapping e -> list of token positions and their weight index
+        uniq = torch.unique(idx)
+        out = x.new_zeros((T, H))
+
+        # Pre-fetch experts asynchronously to overlap H2D/dequant with compute
+        if self.h2d_stream is not None:
+            with torch.cuda.stream(self.h2d_stream):
+                for e in uniq.tolist():
+                    _ = self._get_expert_weights(e, t.device)
+            torch.cuda.current_stream().wait_stream(self.h2d_stream)
+
+        # For small T, simply loop over unique experts
+        for e in uniq.tolist():
+            # Find where this expert is used
+            mask = (idx == e)
+            if not mask.any():
+                continue
+            # Tokens selecting this expert and the corresponding mixture weights
+            tok_pos, which = mask.nonzero(as_tuple=True)  # arrays of indices
+            t_tok = t.index_select(0, tok_pos)  # (N, H)
+            w_mix = probs[tok_pos, which]       # (N,)
+
+            # Dequantize this expert's weights on device
+            W1, W2 = self._get_expert_weights(e, t.device)
+            b1 = self.mlp1_bias[e]  # (2I,)
+            b2 = self.mlp2_bias[e]  # (H,)
+
+            # First MLP: (N,H) @ (H,2I) -> (N,2I)
+            x1 = torch.matmul(t_tok, W1.t()) + b1
+            x1 = swiglu(x1, limit=self.swiglu_limit)  # (N, I)
+            # Second MLP: (N,I) @ (I,H) -> (N,H)
+            x2 = torch.matmul(x1, W2.t()) + b2
+
+            # Mixture combine for these tokens
+            out.index_add_(0, tok_pos, x2 * w_mix[:, None])
+
         if self.world_size > 1:
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        t += mlp2_bias
+            dist.all_reduce(out, op=dist.ReduceOp.SUM)
 
-        # Weighted sum of experts
-        t = torch.einsum("bec,be->bc", t, expert_weights)
-
-        return x + t
+        return x + out
 
 
 class TransformerBlock(torch.nn.Module):
@@ -372,8 +435,8 @@ class TransformerBlock(torch.nn.Module):
         self.attn = AttentionBlock(config, layer_idx, device)
         self.mlp = MLPBlock(config, device)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.attn(x)
+    def forward(self, x: torch.Tensor, cache: "Cache" | None = None) -> torch.Tensor:
+        x = self.attn(x, cache=cache)
         x = self.mlp(x)
         return x
 
@@ -403,10 +466,14 @@ class Transformer(torch.nn.Module):
             dtype=torch.bfloat16,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, caches: list["Cache"] | None = None) -> torch.Tensor:
+        # x: (T,) token ids (long or int)
+        if x.dtype != torch.long:
+            x = x.to(torch.long)
         x = self.embedding(x)
-        for block in self.block:
-            x = block(x)
+        caches = caches or [None] * len(self.block)
+        for block, cache in zip(self.block, caches):
+            x = block(x, cache=cache)
         x = self.norm(x)
         x = self.unembedding(x)
         return x
@@ -435,6 +502,7 @@ class Transformer(torch.nn.Module):
         per_rank_intermediate_size = config.intermediate_size // world_size
 
         checkpoint = Checkpoint(path, device)
+        cpu_checkpoint = Checkpoint(path, torch.device("cpu"))
 
         for name, param in model.named_parameters():
             loaded_tensor = checkpoint.get(name)
@@ -462,6 +530,28 @@ class Transformer(torch.nn.Module):
                 print(f"{name=} {param.data.shape=} {loaded_tensor.shape=}")
                 raise
 
+        # Attach compressed MoE weights per layer (CPU resident)
+        for layer_idx in range(config.num_hidden_layers):
+            # Use PARAM_NAME_MAP in weights.Checkpoint
+            from gpt_oss.torch_impl.weights import PARAM_NAME_MAP
+            mlp1_blocks_key, mlp1_scales_key = PARAM_NAME_MAP[f"block.{layer_idx}.mlp.mlp1_weight"]
+            mlp2_blocks_key, mlp2_scales_key = PARAM_NAME_MAP[f"block.{layer_idx}.mlp.mlp2_weight"]
+
+            mlp1_blocks_cpu = cpu_checkpoint._get_tensor(mlp1_blocks_key).pin_memory()
+            mlp1_scales_cpu = cpu_checkpoint._get_tensor(mlp1_scales_key).pin_memory()
+            mlp2_blocks_cpu = cpu_checkpoint._get_tensor(mlp2_blocks_key).pin_memory()
+            mlp2_scales_cpu = cpu_checkpoint._get_tensor(mlp2_scales_key).pin_memory()
+
+            comp = MoECompressed(
+                mlp1_blocks_cpu,
+                mlp1_scales_cpu,
+                mlp2_blocks_cpu,
+                mlp2_scales_cpu,
+                inter_size=config.intermediate_size // (dist.get_world_size() if dist.is_initialized() else 1),
+                hidden_size=config.hidden_size,
+            )
+            model.block[layer_idx].mlp.set_compressed(comp)
+
         return model
 
 
@@ -470,6 +560,23 @@ class TokenGenerator:
     def __init__(self, checkpoint: str, device: torch.device):
         self.device = device
         self.model = Transformer.from_checkpoint(checkpoint, device=self.device)
+        # Allocate per-layer KV caches for incremental decoding
+        config = ModelConfig(**json.load(open(os.path.join(checkpoint, "config.json"))))
+        self.caches = [
+            Cache(
+                n_ctx=config.initial_context_length,
+                n_kv_heads=config.num_key_value_heads,
+                d_head=config.head_dim,
+                device=self.device,
+            )
+            for _ in range(config.num_hidden_layers)
+        ]
+        # CUDA graph setup for fixed 1-token step
+        self._graph_ready = False
+        if self.device.type == 'cuda':
+            self._input_token = torch.zeros(1, dtype=torch.long, device=self.device)
+            self._logits_buf = None
+            self._graph = torch.cuda.CUDAGraph()
 
     @torch.inference_mode()
     def generate(self,
@@ -478,25 +585,76 @@ class TokenGenerator:
                  temperature: float = 1.0,
                  max_tokens: int = 0,
                  return_logprobs: bool = False):
-        tokens = list(prompt_tokens)
+        # Reset caches
+        for c in self.caches:
+            c.reset()
+
+        # Prefill with all but last token to populate caches
+        if len(prompt_tokens) > 1:
+            prefill = torch.as_tensor(prompt_tokens[:-1], dtype=torch.long, device=self.device)
+            _ = self.model(prefill, caches=self.caches)
+            current = int(prompt_tokens[-1])
+        else:
+            current = int(prompt_tokens[0])
+
         num_generated_tokens = 0
         while max_tokens == 0 or num_generated_tokens < max_tokens:
-            logits = self.model(torch.as_tensor(tokens, dtype=torch.int32, device=self.device))[-1]
+            if self.device.type == 'cuda':
+                # Capture the 1-token step on first iteration
+                self._input_token[0] = current
+                if not self._graph_ready:
+                    # Warmup allocation for logits buffer
+                    logits_full = self.model(self._input_token, caches=self.caches)
+                    self._logits_buf = torch.empty_like(logits_full)
+                    torch.cuda.synchronize()
+                    with torch.cuda.graph(self._graph):
+                        self._logits_buf.copy_(self.model(self._input_token, caches=self.caches))
+                    self._graph_ready = True
+                    logits = self._logits_buf[-1]
+                else:
+                    self._graph.replay()
+                    logits = self._logits_buf[-1]
+            else:
+                x = torch.as_tensor([current], dtype=torch.long, device=self.device)
+                logits = self.model(x, caches=self.caches)[-1]
             if temperature == 0.0:
-                predicted_token = torch.argmax(logits, dim=-1).item()
+                next_token = torch.argmax(logits, dim=-1).item()
             else:
                 probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
-                predicted_token = torch.multinomial(probs, num_samples=1).item()
-            tokens.append(predicted_token)
-            num_generated_tokens += 1
+                next_token = torch.multinomial(probs, num_samples=1).item()
 
+            num_generated_tokens += 1
             if return_logprobs:
                 logprobs = torch.log_softmax(logits, dim=-1)
-                selected_logprobs = logprobs[predicted_token].item()
-                yield predicted_token, selected_logprobs
+                yield next_token, logprobs[next_token].item()
             else:
-                yield predicted_token
+                yield next_token
 
-            if predicted_token in stop_tokens:
+            if next_token in stop_tokens:
                 break
-from __future__ import annotations
+            current = next_token
+
+        return
+
+
+class Cache:
+    def __init__(self, n_ctx: int, n_kv_heads: int, d_head: int, device: torch.device | None = None):
+        self.k = torch.zeros((n_ctx, n_kv_heads, d_head), dtype=torch.bfloat16, device=device)
+        self.v = torch.zeros((n_ctx, n_kv_heads, d_head), dtype=torch.bfloat16, device=device)
+        self.offset = torch.zeros((1,), dtype=torch.long, device=device)
+
+    def reset(self):
+        self.k.zero_()
+        self.v.zero_()
+        self.offset.zero_()
+
+    def extend(self, k: torch.Tensor, v: torch.Tensor):
+        # k,v: (T, n_kv_heads, d_head)
+        T = k.shape[0]
+        start = int(self.offset.item())
+        end = start + T
+        self.k[start:end, :, :].copy_(k)
+        self.v[start:end, :, :].copy_(v)
+        self.offset.add_(T)
+        # Return full K/V up to current end
+        return self.k[:end, :, :], self.v[:end, :, :]
